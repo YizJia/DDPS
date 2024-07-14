@@ -1,0 +1,259 @@
+from collections import OrderedDict
+import torch.nn as nn
+import torch.nn.functional as F
+import torch
+from torchvision.ops import boxes as box_ops
+from ._base import Distiller
+# from mmcv.runner import _load_checkpoint, load_state_dict
+from .ReviewKD import ABF, hcl
+from .DKD import dkd_loss
+
+class ReviewKD_DKD_Relation(Distiller):
+    def __init__(self, cfg, student, teacher):
+        super(ReviewKD_DKD_Relation, self).__init__(student, teacher)
+        self.device = torch.device(cfg.DEVICE)
+        # ReviewKD distiller
+        self.reviewkd_weight = cfg.REVIEWKD.WEIGHT
+        # detection decoupled cls distiller
+        self.alpha = cfg.DKD.ALPHA
+        self.beta = cfg.DKD.BETA
+        self.temperature = cfg.DKD.T
+        self.from_T = cfg.DKD.FROM_T
+        # Relation distiller
+        self.from_T = cfg.GRAPHRELA.FROM_T
+        self.warmup = cfg.GRAPHRELA.WARMUP
+        self.weight = cfg.GRAPHRELA.WEIGHT
+        self.nms_threshold = cfg.GRAPHRELA.NMSTHRES
+
+        # initialization config: init_student
+        # if cfg.DISTILLER.INIT_STUDENT:
+        #     t_checkpoint = _load_checkpoint(cfg.DISTILLER.TEACHER.CKPT)
+        #     all_name = []
+        #     for name, v in t_checkpoint["model"].items():
+        #         if name.startswith("backbone.body."):
+        #             continue
+        #         elif name.startswith("backbone.fpn."):
+        #             continue
+        #         else:
+        #             all_name.append((name, v))
+
+        #     state_dict = OrderedDict(all_name)
+        #     load_state_dict(self.student, state_dict)
+
+        in_channels = [256,256,256,256,256]
+        out_channels = [256,256,256,256,256]
+        mid_channel = 256
+
+        abfs = nn.ModuleList()
+
+        for idx, in_channel in enumerate(in_channels):
+            abfs.append(ABF(in_channel, mid_channel, out_channels[idx], idx < len(in_channels)-1))
+
+        self.abfs = abfs[::-1]
+
+    # specific Relation KD method 
+    def select_complete_persons(self, t_box_embeddings, s_box_embeddings, generate_boxes, generate_box_pids, reid_box_logits):
+        boxes_per_images = [len(boxes_in_images) for boxes_in_images in generate_boxes]
+        pred_boxes = torch.cat(generate_boxes, dim=0)
+        pred_box_pids = torch.cat(generate_box_pids, dim=0)
+        softmax_scores = F.softmax(reid_box_logits, dim=-1)
+
+        assert sum(boxes_per_images) == pred_boxes.shape[0]
+        assert pred_boxes.shape[0] == pred_box_pids.shape[0]
+
+        person_box_pids = pred_box_pids - 1
+        # only reserve the boxes belong to person instances
+        inds = torch.nonzero(person_box_pids >= 0).squeeze(1)
+        assert len(inds) == softmax_scores.shape[0]
+        pred_boxes, pred_box_pids, t_embeddings, s_embeddings = (
+                pred_boxes[inds],
+                pred_box_pids[inds],
+                t_box_embeddings[inds],
+                s_box_embeddings[inds],
+            )
+        
+        # get pred_scores from softmax output based on the pids
+        pred_scores = torch.zeros([softmax_scores.shape[0]]).to(self.device)
+        for i in range(softmax_scores.shape[0]):
+            person_indx = pred_box_pids[i]
+            assert person_indx > 0
+            if person_indx < 5555:
+                pred_scores[i] = softmax_scores[i][person_indx-1]
+            else:
+                # cuhk-sysu
+                # pred_scores[i] = torch.max(softmax_scores[i][5532:])
+                # prw
+                pred_scores[i] = torch.max(softmax_scores[i][482:])
+
+        # get the number of person instances in each image
+        persons_per_images = []
+        start = 0
+        for i, boxes_image in enumerate(boxes_per_images):
+            count = 0
+            for j in range(len(inds)):
+                if inds[j] < start:
+                    continue
+                elif inds[j] >= start+boxes_image:
+                    break
+                else:
+                    count = count + 1
+            persons_per_images.append(count)
+            start = start + boxes_image
+        
+        assert pred_scores.shape[0] == sum(persons_per_images)
+
+        
+        pred_boxes = pred_boxes.split(persons_per_images,0)
+        pred_box_pids = pred_box_pids.split(persons_per_images,0)
+        pred_scores = pred_scores.split(persons_per_images,0)
+        pred_t_embeddings = t_embeddings.split(persons_per_images,0)
+        pred_s_embeddings = s_embeddings.split(persons_per_images,0)
+
+        all_boxes = []
+        all_box_pids = []
+        all_scores = []
+        all_t_embeddings = []
+        all_s_embeddings = []
+
+        for boxes, box_pids, scores, t_embeddings, s_embeddings in zip(
+            pred_boxes, pred_box_pids, pred_scores, pred_t_embeddings, pred_s_embeddings
+        ):
+            # batch everything, by making every class prediction be a separate instance
+            boxes = boxes.reshape(-1, 4)
+            box_pids = box_pids.flatten()
+            scores = scores.flatten()
+            t_embeddings = t_embeddings.reshape(-1, 256)
+            s_embeddings = s_embeddings.reshape(-1, 256)
+
+            # select embeddings
+            # which correspond to boxes with higher scores (using LT & CQ), more complete person
+            # remove low scoreing reid embeddings
+            # modify v2.3
+            # modify v2.1
+            # inds = torch.nonzero(scores > self.threshold).squeeze(1)
+            # boxes, box_pids, scores, t_embeddings, s_embeddings = (
+            #     boxes[inds],
+            #     box_pids[inds],
+            #     scores[inds],
+            #     t_embeddings[inds],
+            #     s_embeddings[inds],
+            # )
+                
+            # remove empty boxes
+            inds = box_ops.remove_small_boxes(boxes, min_size=1e-2)
+            boxes, box_pids, scores, t_embeddings, s_embeddings = (
+                boxes[inds],
+                box_pids[inds],
+                scores[inds],
+                t_embeddings[inds],
+                s_embeddings[inds],
+            ) 
+            
+            # non-maximum suppression, independently done per class
+            inds = box_ops.batched_nms(boxes, scores, box_pids, self.nms_threshold)
+            boxes, box_pids, scores, t_embeddings, s_embeddings = (
+                boxes[inds],
+                box_pids[inds],
+                scores[inds],
+                t_embeddings[inds],
+                s_embeddings[inds],
+            )
+            
+            all_boxes.append(boxes)
+            all_box_pids.append(box_pids)
+            all_scores.append(scores)
+            all_t_embeddings.append(t_embeddings)
+            all_s_embeddings.append(s_embeddings)
+
+        t_person_embeddings = torch.cat(all_t_embeddings,0)
+        s_person_embeddings = torch.cat(all_s_embeddings,0)
+
+        return t_person_embeddings, s_person_embeddings
+
+    def forward_train(self, images, targets, **kwargs):
+        # training function for the distillation method
+        student_loss = self.student(images, targets)
+        # make the input of both student and teacher no difference
+        s_images, s_targets = self.student.get_input_network()
+        s_features = self.student.get_features()
+
+        img_shapes = s_images.image_sizes
+
+        if not self.from_T:          
+            # get proposals from student
+            s_proposals, s_proposal_labels = self.student.roi_heads.get_select_proposals() 
+            s_det_pro_cls_scores, _ = self.student.roi_heads.get_logits()
+            # get the detection results -- boxes from student
+            s_boxes, s_box_pids = self.student.roi_heads.get_select_boxes()
+            s_box_embeddings = self.student.roi_heads.get_embeddings()
+
+            generate_boxes = s_boxes
+            generate_box_pids = s_box_pids
+
+        with torch.no_grad():
+            # teacher model forward propagation
+            if self.from_T:
+                # forward propagation for FGD
+                t_proposals, t_detections, t_reid_box_logits, t_box_pids, t_box_embeddings = self.teacher.extract_infor_forKD(s_images, s_targets)
+                t_det_pro_cls_scores, _ = self.teacher.roi_heads.get_logits()
+
+                generate_boxes = [box_per_images["boxes"] for box_per_images in t_detections]
+                generate_box_pids = t_box_pids
+            else:
+                t_features = self.teacher.extract_features(s_images)
+                # detection head part
+                t_proposal_features = self.teacher.roi_heads.box_roi_pool(t_features, s_proposals, img_shapes)
+                t_proposal_features = self.teacher.roi_heads.box_head(t_proposal_features)
+                t_det_pro_cls_scores, _ = self.teacher.roi_heads.faster_rcnn_predictor(t_proposal_features["feat_afFC"])
+                # reid head part
+                t_box_features = self.teacher.roi_heads.box_roi_pool(t_features, s_boxes, img_shapes)
+                t_box_features = self.teacher.roi_heads.reid_head(t_box_features)
+                t_box_embeddings, _ = self.teacher.roi_heads.embedding_head(t_box_features)
+                t_reid_box_logits = self.teacher.roi_heads.reid_loss.get_soften_logits(t_box_embeddings, s_box_pids)
+
+        if self.from_T:
+            # student detection part
+            s_det_pro_fea = self.student.roi_heads.box_roi_pool(s_features, t_proposals, img_shapes)
+            s_det_pro_features = self.student.roi_heads.box_head(s_det_pro_fea)
+            s_det_pro_cls_scores, _ = self.student.roi_heads.faster_rcnn_predictor(
+                s_det_pro_features["feat_afFC"]
+            )
+            # student reid part
+            s_reid_box_logits, _, s_box_embeddings = self.student.roi_heads.extract_infor_forKD(s_features, t_detections, img_shapes, box_labels=t_box_pids)
+
+        # after prepare the features/embeddings for KD methods
+        # ReviewKD process
+        stu_features = [s_features[f] for f in s_features]
+        tea_features = [t_features[f] for f in t_features]
+        x = stu_features[::-1]
+        new_stu_features = []
+        out_features, res_features = self.abfs[0](x[0])
+        new_stu_features.append(out_features)
+        for features, abf in zip(x[1:], self.abfs[1:]):
+            out_features, res_features = abf(features, res_features)
+            new_stu_features.insert(0, out_features)
+
+        student_loss["reviewkd"] = self.reviewkd_weight * hcl(new_stu_features, tea_features)
+
+        # Detection decoupled cls KD process
+        loss_det_dkd = dkd_loss(s_det_pro_cls_scores, t_det_pro_cls_scores, torch.cat(s_proposal_labels, dim=0),
+                                self.alpha, self.beta, self.temperature)
+        student_loss["loss_det_dkd"] = loss_det_dkd
+
+        # Relation KD process
+        t_person_embeddings, s_person_embeddings = self.select_complete_persons(t_box_embeddings, s_box_embeddings,
+                                                                               generate_boxes, generate_box_pids,
+                                                                               t_reid_box_logits)
+
+        # t_person_embeddings, s_person_embeddings = t_box_embeddings, s_box_embeddings
+        # the embeddings already are normed
+        t_similarity = torch.mm(t_person_embeddings, t_person_embeddings.T)
+        s_similarity = torch.mm(s_person_embeddings, s_person_embeddings.T)
+
+        assert t_similarity.shape == s_similarity.shape
+
+        loss_mse = nn.MSELoss(reduction='sum')
+        node_loss = loss_mse(s_similarity, t_similarity)
+        # student_loss["reid_graph_loss"] = min(kwargs["epoch"] / self.warmup, 1.0) * node_loss
+        student_loss["reid_graph_loss"] =  self.weight * node_loss
+        return student_loss
